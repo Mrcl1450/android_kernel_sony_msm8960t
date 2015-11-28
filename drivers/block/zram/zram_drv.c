@@ -29,6 +29,7 @@
 #include <linux/genhd.h>
 #include <linux/highmem.h>
 #include <linux/slab.h>
+#include <linux/lzo.h>
 #include <linux/string.h>
 #include <linux/vmalloc.h>
 #include <linux/ratelimit.h>
@@ -38,7 +39,6 @@
 /* Globals */
 static int zram_major;
 static struct zram *zram_devices;
-static const char *default_compressor = "lzo";
 
 /*
  * We don't need to see memory allocation errors more than once every 1
@@ -166,6 +166,8 @@ static inline int valid_io_request(struct zram *zram, struct bio *bio)
 static void zram_meta_free(struct zram_meta *meta)
 {
 	zs_destroy_pool(meta->mem_pool);
+	kfree(meta->compress_workmem);
+	free_pages((unsigned long)meta->compress_buffer, 1);
 	vfree(meta->table);
 	kfree(meta);
 }
@@ -177,11 +179,22 @@ static struct zram_meta *zram_meta_alloc(u64 disksize)
 	if (!meta)
 		goto out;
 
+	meta->compress_workmem = kzalloc(LZO1X_MEM_COMPRESS, GFP_KERNEL);
+	if (!meta->compress_workmem)
+		goto free_meta;
+
+	meta->compress_buffer =
+		(void *)__get_free_pages(GFP_KERNEL | __GFP_ZERO, 1);
+	if (!meta->compress_buffer) {
+		pr_err("Error allocating compressor buffer space\n");
+		goto free_workmem;
+	}
+
 	num_pages = disksize >> PAGE_SHIFT;
 	meta->table = vzalloc(num_pages * sizeof(*meta->table));
 	if (!meta->table) {
 		pr_err("Error allocating zram address table\n");
-		goto free_meta;
+		goto free_buffer;
 	}
 
 	meta->mem_pool = zs_create_pool(GFP_NOIO | __GFP_HIGHMEM |
@@ -192,10 +205,15 @@ static struct zram_meta *zram_meta_alloc(u64 disksize)
 	}
 
 	rwlock_init(&meta->tb_lock);
+	mutex_init(&meta->buffer_lock);
 	return meta;
 
 free_table:
 	vfree(meta->table);
+free_buffer:
+	free_pages((unsigned long)meta->compress_buffer, 1);
+free_workmem:
+	kfree(meta->compress_workmem);
 free_meta:
 	kfree(meta);
 	meta = NULL;
@@ -269,7 +287,8 @@ static void zram_free_page(struct zram *zram, size_t index)
 
 static int zram_decompress_page(struct zram *zram, char *mem, u32 index)
 {
-	int ret = 0;
+	int ret = LZO_E_OK;
+	size_t clen = PAGE_SIZE;
 	unsigned char *cmem;
 	struct zram_meta *meta = zram->meta;
 	unsigned long handle;
@@ -289,12 +308,12 @@ static int zram_decompress_page(struct zram *zram, char *mem, u32 index)
 	if (size == PAGE_SIZE)
 		copy_page(mem, cmem);
 	else
-		ret = zcomp_decompress(zram->comp, cmem, size, mem);
+		ret = lzo1x_decompress_safe(cmem, size,	mem, &clen);
 	zs_unmap_object(meta->mem_pool, handle);
 	read_unlock(&meta->tb_lock);
 
 	/* Should NEVER happen. Return bio error if it does. */
-	if (unlikely(ret)) {
+	if (unlikely(ret != LZO_E_OK)) {
 		pr_err("Decompression failed! err=%d, page=%u\n", ret, index);
 		atomic64_inc(&zram->stats.failed_reads);
 		return ret;
@@ -337,7 +356,7 @@ static int zram_bvec_read(struct zram *zram, struct bio_vec *bvec,
 
 	ret = zram_decompress_page(zram, uncmem, index);
 	/* Should NEVER happen. Return bio error if it does. */
-	if (unlikely(ret))
+	if (unlikely(ret != LZO_E_OK))
 		goto out_cleanup;
 
 	if (is_partial_io(bvec))
@@ -363,10 +382,11 @@ static int zram_bvec_write(struct zram *zram, struct bio_vec *bvec, u32 index,
 	unsigned char *user_mem, *cmem, *src, *uncmem = NULL;
 	struct zram_meta *meta = zram->meta;
 	static unsigned long zram_rs_time;
-	struct zcomp_strm *zstrm;
 	bool locked = false;
 
 	page = bvec->bv_page;
+	src = meta->compress_buffer;
+
 	if (is_partial_io(bvec)) {
 		/*
 		 * This is a partial IO. We need to read the full page
@@ -383,7 +403,7 @@ static int zram_bvec_write(struct zram *zram, struct bio_vec *bvec, u32 index,
 			goto out;
 	}
 
-	zstrm = zcomp_strm_find(zram->comp);
+	mutex_lock(&meta->buffer_lock);
 	locked = true;
 	user_mem = kmap_atomic(page);
 
@@ -409,20 +429,22 @@ static int zram_bvec_write(struct zram *zram, struct bio_vec *bvec, u32 index,
 		goto out;
 	}
 
-	ret = zcomp_compress(zram->comp, zstrm, uncmem, &clen);
+	ret = lzo1x_1_compress(uncmem, PAGE_SIZE, src, &clen,
+			       meta->compress_workmem);
 	if (!is_partial_io(bvec)) {
 		kunmap_atomic(user_mem);
 		user_mem = NULL;
 		uncmem = NULL;
 	}
 
-	if (unlikely(ret)) {
+	if (unlikely(ret != LZO_E_OK)) {
 		pr_err("Compression failed! err=%d\n", ret);
 		goto out;
 	}
-	src = zstrm->buffer;
+
 	if (unlikely(clen > max_zpage_size)) {
 		clen = PAGE_SIZE;
+		src = NULL;
 		if (is_partial_io(bvec))
 			src = uncmem;
 	}
@@ -446,8 +468,6 @@ static int zram_bvec_write(struct zram *zram, struct bio_vec *bvec, u32 index,
 		memcpy(cmem, src, clen);
 	}
 
-	zcomp_strm_release(zram->comp, zstrm);
-	locked = false;
 	zs_unmap_object(meta->mem_pool, handle);
 
 	/*
@@ -466,9 +486,10 @@ static int zram_bvec_write(struct zram *zram, struct bio_vec *bvec, u32 index,
 	atomic64_inc(&zram->stats.pages_stored);
 out:
 	if (locked)
-		zcomp_strm_release(zram->comp, zstrm);
+		mutex_unlock(&meta->buffer_lock);
 	if (is_partial_io(bvec))
 		kfree(uncmem);
+
 	if (ret)
 		atomic64_inc(&zram->stats.failed_writes);
 	return ret;
@@ -512,7 +533,6 @@ static void zram_reset_device(struct zram *zram, bool reset_capacity)
 		zs_free(meta->mem_pool, handle);
 	}
 
-	zcomp_destroy(zram->comp);
 	zram_meta_free(zram->meta);
 	zram->meta = NULL;
 	/* Reset stats */
@@ -530,7 +550,6 @@ static ssize_t disksize_store(struct device *dev,
 	u64 disksize;
 	struct zram_meta *meta;
 	struct zram *zram = dev_to_zram(dev);
-	int err;
 
 	disksize = memparse(buf, NULL);
 	if (!disksize)
@@ -543,17 +562,10 @@ static ssize_t disksize_store(struct device *dev,
 
 	down_write(&zram->init_lock);
 	if (init_done(zram)) {
+		zram_meta_free(meta);
+		up_write(&zram->init_lock);
 		pr_info("Cannot change disksize for initialized device\n");
-		err = -EBUSY;
-		goto out_free_meta;
-	}
-
-	zram->comp = zcomp_create(default_compressor);
-	if (!zram->comp) {
-		pr_info("Cannot initialise %s compressing backend\n",
-				default_compressor);
-		err = -EINVAL;
-		goto out_free_meta;
+		return -EBUSY;
 	}
 
 	zram->meta = meta;
@@ -562,11 +574,6 @@ static ssize_t disksize_store(struct device *dev,
 	up_write(&zram->init_lock);
 
 	return len;
-
-out_free_meta:
-	up_write(&zram->init_lock);
-	zram_meta_free(meta);
-	return err;
 }
 
 static ssize_t reset_store(struct device *dev,
